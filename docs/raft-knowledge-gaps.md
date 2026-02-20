@@ -14,7 +14,9 @@
 5. [Failure Taxonomy](#5-failure-taxonomy)
 6. [Minority Partition — Full Walkthrough](#6-minority-partition--full-walkthrough)
 7. [Idempotent Re-Vote](#7-idempotent-re-vote)
-8. [Test Cases Map to Real Scenarios](#8-test-cases-map-to-real-scenarios)
+8. [AppendEntries — Heartbeat & Step-Down](#8-appendentries--heartbeat--step-down)
+9. [Election Timer — How It Works in Go](#9-election-timer--how-it-works-in-go)
+10. [Test Cases Map to Real Scenarios](#10-test-cases-map-to-real-scenarios)
 
 ---
 
@@ -412,7 +414,226 @@ votedFor=1 (other)  → voted for someone else, all others denied
 
 ---
 
-## 8. Test Cases Map to Real Scenarios
+## 8. AppendEntries — Heartbeat & Step-Down
+
+### Two Jobs in One RPC
+
+```
+AppendEntries serves two purposes:
+
+1. Heartbeat    — Leader proves it is alive (entries = empty)
+2. Replication  — Leader ships log entries to followers
+```
+
+Never mix them up. Heartbeat is just AppendEntries with an empty
+entries list. The receiver handles both paths through the same RPC.
+
+---
+
+### Heartbeat Decision Table
+
+```
+┌──────────────────────────────────┬──────────────────────────────────────┐
+│ Condition                        │ Result                               │
+├──────────────────────────────────┼──────────────────────────────────────┤
+│ req.Term < currentTerm           │ REJECT — stale leader                │
+│                                  │ return Success=false, Term=current   │
+│                                  │ do NOT reset election timer          │
+├──────────────────────────────────┼──────────────────────────────────────┤
+│ req.Term > currentTerm           │ update term, step down to Follower   │
+│                                  │ then accept heartbeat                │
+├──────────────────────────────────┼──────────────────────────────────────┤
+│ req.Term == currentTerm          │ accept heartbeat                     │
+│ AND state == Candidate           │ step down to Follower (§5.2)         │
+├──────────────────────────────────┼──────────────────────────────────────┤
+│ req.Term == currentTerm          │ accept heartbeat                     │
+│ AND state == Follower            │ reset election timer                 │
+└──────────────────────────────────┴──────────────────────────────────────┘
+```
+
+---
+
+### The Gap That Was Missed — Candidate Same-Term Step-Down
+
+The natural instinct is to only step down when `req.Term > currentTerm`.
+But the Raft paper §5.2 says:
+
+> "If a candidate receives AppendEntries from a server with a term
+> **at least as large** as its own, it recognizes the leader as
+> legitimate and returns to follower state."
+
+The word "at least" means `>=`, not just `>`.
+
+```
+Why it matters:
+
+Two candidates, both at term=2. One wins.
+Winner sends heartbeat(term=2) to the loser.
+
+If loser ignores same-term heartbeat:
+  Loser stays Candidate → keeps trying to start another election
+  → cluster has a Candidate fighting a legitimate Leader
+  → split-election loop, liveness breaks
+
+If loser steps down on same-term heartbeat:
+  Loser becomes Follower → cluster stabilizes ✓
+```
+
+In code:
+```go
+if req.Term > uint64(s.currentTerm) {
+    s.currentTerm = int64(req.Term)
+    s.state = raft.Follower
+} else if req.Term == uint64(s.currentTerm) && s.state == raft.Candidate {
+    s.state = raft.Follower  // ← this line is easy to miss
+}
+```
+
+---
+
+### Why a Stale Heartbeat Must NOT Reset the Timer
+
+```
+Scenario: Old leader (term=1) is partitioned.
+          New leader (term=3) is elected.
+          Old leader's partition heals.
+          Old leader sends heartbeat(term=1) to followers.
+
+If followers reset their timer on stale heartbeats:
+  → Followers keep resetting timer
+  → Nobody ever times out
+  → New leader never gets confirmed
+  → Cluster stalls
+
+Correct behaviour:
+  Stale heartbeat is rejected (term < currentTerm)
+  Timer is NOT reset
+  Follower eventually times out and confirms the real leader
+```
+
+Test for this: capture `timerResetCount` before the call,
+assert it is unchanged after a stale rejection.
+
+---
+
+### AppendEntries Term Check Must Come First
+
+The stale term check must be at the top of the function — before
+checking whether entries is empty or not:
+
+```
+WRONG structure:
+  if len(entries) == 0 {
+      if req.Term < currentTerm { reject }  ← only checked for heartbeats
+      ...
+  }
+  // entries path skips the term check entirely
+
+CORRECT structure:
+  if req.Term < currentTerm { reject }      ← checked for ALL requests
+  if req.Term > currentTerm { step down }
+
+  if len(entries) == 0 {
+      // heartbeat path
+  }
+  // entries path (future)
+```
+
+This matters when you implement log replication — a stale leader
+sending entries would bypass the check in the wrong structure.
+
+---
+
+## 9. Election Timer — How It Works in Go
+
+### The Mechanism
+
+```
+Follower starts with a randomized timer (150-300ms).
+
+Every valid heartbeat resets the timer.
+If timer fires → no heartbeat received in time
+             → assume leader is dead
+             → become Candidate, start election
+```
+
+### Go Timer Primitives
+
+```go
+// One-shot timer (what Raft needs — NOT time.Ticker)
+timer := time.NewTimer(200 * time.Millisecond)
+
+<-timer.C          // blocks until timer fires
+
+timer.Stop()       // cancel before it fires
+
+// Safe reset pattern — MUST drain channel first
+if !timer.Stop() {
+    select {
+    case <-timer.C:
+    default:
+    }
+}
+timer.Reset(newDuration)
+```
+
+Why drain the channel: if the timer already fired before `Stop()`,
+the channel has a value in it. If you `Reset()` without draining,
+your goroutine sees two fires instead of one — a phantom timeout.
+
+### Randomized Timeout
+
+```go
+func randomElectionTimeout() time.Duration {
+    return time.Duration(150+rand.Intn(150)) * time.Millisecond
+}
+```
+
+All nodes use different timeouts so they don't all start elections
+simultaneously. The first to time out wins the race to campaign.
+
+### The Goroutine Loop
+
+```go
+func (s *RaftServer) runElectionTimer() {
+    for {
+        <-s.electionTimer.C   // blocks until timer fires
+        s.mu.Lock()
+        s.state = raft.Candidate
+        s.currentTerm++
+        s.votedFor = 0
+        s.mu.Unlock()
+        // → send RequestVote to peers (next phase)
+    }
+}
+```
+
+### Testing Timer Resets — Use a Counter, Not time.Time
+
+```
+WRONG approach:
+  prevTime := s.lastResetTime
+  // ... call AppendEntries ...
+  if s.lastResetTime.Equal(prevTime) { t.Error(...) }
+
+  Problem: Windows clock resolution can be ~15ms.
+           If everything runs within one tick, both times are equal.
+           Test passes when it shouldn't (or flickers).
+
+RIGHT approach:
+  prevCount := s.timerResetCount
+  // ... call AppendEntries ...
+  if s.timerResetCount == prevCount { t.Error(...) }
+
+  A counter increments atomically — no clock dependency.
+  Reliable on all platforms.
+```
+
+---
+
+## 10. Test Cases Map to Real Scenarios
+
+### RequestVote
 
 | Test | Real cluster scenario |
 |------|-----------------------|
@@ -423,6 +644,16 @@ votedFor=1 (other)  → voted for someone else, all others denied
 | `StaleLogDenied_OlderTerm` | Node missed elections, has older lastLogTerm, tries to become leader |
 | `StaleLogDenied_ShorterIndex` | Node partially replicated, same term but shorter log |
 | `IdempotentReVote` | Network drops vote response, candidate retries |
+
+### AppendEntries (Heartbeat)
+
+| Test | Real cluster scenario |
+|------|-----------------------|
+| `RejectStaleTerm` | Old partitioned leader reconnects, sends stale heartbeat |
+| `AcceptHeartbeat` | Normal operation, follower receives leader heartbeat |
+| `StepDownOnValidHeartbeat/follower_updates_term_on_higher_term` | New leader elected with higher term, old follower must update |
+| `StepDownOnValidHeartbeat/candidate_steps_down_on_same_term` | Split election resolved — losing candidate receives winner's heartbeat |
+| `StepDownOnValidHeartbeat/candidate_steps_down_on_higher_term` | Candidate from old term receives heartbeat from new-term leader |
 
 ---
 
@@ -435,10 +666,22 @@ RequestVote — when to GRANT:
   AND (req.LastLogTerm > lastLogTerm
        OR (req.LastLogTerm == lastLogTerm AND req.LastLogIndex >= lastLogIndex))
 
-On seeing req.Term > currentTerm (any RPC, not just RequestVote):
+AppendEntries — when to ACCEPT heartbeat:
+  req.Term >= currentTerm                    → not stale
+  reset election timer                       → leader is alive
+  if req.Term > currentTerm  → update term, step down to Follower
+  if req.Term == currentTerm
+     AND state == Candidate  → step down to Follower (§5.2)
+
+On seeing req.Term > currentTerm (any RPC):
   currentTerm = req.Term
   votedFor    = 0
   state       = Follower
+
+Election Timer:
+  Randomized 150-300ms — fires when no heartbeat received
+  Reset on every valid heartbeat
+  Use a counter (not time.Time) to test resets — clock resolution issue on Windows
 
 Terms:
   Only move forward, never back.
