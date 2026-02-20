@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"testing"
+	"time"
 
 	pb "github.com/rajesh/kvstore/proto"
 	raft "github.com/rajesh/kvstore/raft"
@@ -15,6 +16,7 @@ func newServer(term uint64, votedFor uint32, lastLogIndex, lastLogTerm uint64) *
 		votedFor:     votedFor,
 		lastLogIndex: lastLogIndex,
 		lastLogTerm:  lastLogTerm,
+		electionTimer: time.NewTimer(randomElectionTimeout()),
 	}
 }
 
@@ -183,5 +185,102 @@ func TestRequestVote_IdempotentReVote(t *testing.T) {
 
 	if s.votedFor != 2 {
 		t.Errorf("expected votedFor=2, got %d", s.votedFor)
+	}
+}
+
+func TestAppendEntries_RejectStaleTerm(t *testing.T) {
+	s := newServer(5, 0, 0, 0)
+	prevCount := s.timerResetCount
+
+	resp, err := s.AppendEntries(context.Background(), &pb.AppendEntriesRequest{
+		Term: 3, // older than currentTerm=5
+	})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Success {
+		t.Error("expected AppendEntries rejected for stale term, got success")
+	}
+
+	if resp.Term != 5 {
+		t.Errorf("expected resp.Term=5, got %d", resp.Term)
+	}
+
+	if s.timerResetCount != prevCount {
+		t.Error("expected election timer NOT to reset on stale heartbeat, but it did")
+	}
+}
+
+func TestAppendEntries_AcceptHeartbeat(t *testing.T) {
+	s := newServer(5, 0, 0, 0)
+	prevCount := s.timerResetCount
+	resp, err := s.AppendEntries(context.Background(), &pb.AppendEntriesRequest{
+		Term: 5, // matches currentTerm
+	})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !resp.Success {
+		t.Error("expected AppendEntries accepted for valid heartbeat, got rejected")
+	}
+
+	if resp.Term != 5 {
+		t.Errorf("expected resp.Term=5, got %d", resp.Term)
+	}
+
+	if s.timerResetCount == prevCount {
+		t.Error("expected election timer to reset on valid heartbeat, but timerResetCount did not change")
+	}
+}
+
+func TestAppendEntries_StepDownOnValidHeartbeat(t *testing.T) {
+	tests := []struct {
+		name      string
+		initState raft.NodeState
+		initTerm  uint64
+		reqTerm   uint64
+		wantTerm  uint64
+	}{
+		{"follower updates term on higher term", raft.Follower, 5, 7, 7},
+		{"candidate steps down on same term", raft.Candidate, 2, 2, 2},
+		{"candidate steps down on higher term", raft.Candidate, 2, 5, 5},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newServer(tt.initTerm, 0, 0, 0)
+			s.state = tt.initState
+			prevCount := s.timerResetCount
+
+			resp, err := s.AppendEntries(context.Background(), &pb.AppendEntriesRequest{
+				Term: tt.reqTerm,
+			})
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if resp.Term != tt.wantTerm {
+				t.Errorf("expected wantTerm=%d, got %d", tt.wantTerm, resp.Term)
+			}
+
+			if s.currentTerm != int64(tt.wantTerm) {
+				t.Errorf("expected currentTerm=%d, got %d", tt.wantTerm, s.currentTerm)
+			}
+
+			if s.state != raft.Follower {
+				t.Errorf("expected state to be Follower, got %v", s.state)
+			}
+
+			if s.timerResetCount == prevCount {
+				t.Error("expected election timer to reset on valid heartbeat, but timerResetCount did not change")
+			}
+
+			if !resp.Success {
+				t.Error("expected Success=true on valid heartbeat, got false")
+			}
+
+		})
 	}
 }
