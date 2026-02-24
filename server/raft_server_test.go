@@ -3,21 +3,21 @@ package server
 import (
 	"context"
 	"testing"
-	"time"
 
 	pb "github.com/rajesh/kvstore/proto"
 	raft "github.com/rajesh/kvstore/raft"
 )
 
 func newServer(term uint64, votedFor uint32, lastLogIndex, lastLogTerm uint64) *RaftServer {
-	return &RaftServer{
-		state:        raft.Follower,
-		currentTerm:  int64(term),
-		votedFor:     votedFor,
-		lastLogIndex: lastLogIndex,
-		lastLogTerm:  lastLogTerm,
-		electionTimer: time.NewTimer(randomElectionTimeout()),
+	s := &RaftServer{
+		state:       raft.Follower,
+		currentTerm: term,
+		votedFor:    votedFor,
 	}
+	if lastLogIndex > 0 {
+		s.log = append(s.log, &pb.LogEntry{Index: lastLogIndex, Term: lastLogTerm})
+	}
+	return s
 }
 
 func TestRequestVote_RejectStaleTerm(t *testing.T) {
@@ -99,7 +99,7 @@ func TestRequestVote_UpdateTermOnNewerTerm(t *testing.T) {
 	}
 
 	if s.currentTerm != 2 {
-		t.Errorf("expected term=2 in response, got %d", s.currentTerm)
+		t.Errorf("expected currentTerm=2, got %d", s.currentTerm)
 	}
 
 	if s.state != raft.Follower {
@@ -265,7 +265,7 @@ func TestAppendEntries_StepDownOnValidHeartbeat(t *testing.T) {
 				t.Errorf("expected wantTerm=%d, got %d", tt.wantTerm, resp.Term)
 			}
 
-			if s.currentTerm != int64(tt.wantTerm) {
+			if s.currentTerm != tt.wantTerm {
 				t.Errorf("expected currentTerm=%d, got %d", tt.wantTerm, s.currentTerm)
 			}
 
@@ -282,5 +282,176 @@ func TestAppendEntries_StepDownOnValidHeartbeat(t *testing.T) {
 			}
 
 		})
+	}
+}
+
+func TestAppendEntries_AppendsFirstEntry(t *testing.T) {
+	s := newServer(0, 0, 0, 0)
+	resp, err := s.AppendEntries(context.Background(), &pb.AppendEntriesRequest{
+		Term: 1,
+		Entries: []*pb.LogEntry{
+			{Index: 1, Term: 1, Command: []byte("set x=1")},
+		},
+	})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !resp.Success {
+		t.Error("expected AppendEntries accepted for first entry, got rejected")
+	}
+
+	if len(s.log) != 1 {
+		t.Errorf("expected log length=1, got %d", len(s.log))
+	}
+
+}
+
+func TestAppendEntries_MatchingPreviousEntries(t *testing.T) {
+	s := newServer(1, 0, 0, 0)
+	s.log = []*pb.LogEntry{
+		{Index: 1, Term: 1},
+		{Index: 2, Term: 2},
+	}
+	req := &pb.AppendEntriesRequest{
+		Term:         2,
+		PrevLogIndex: 2,
+		PrevLogTerm:  2,
+		Entries: []*pb.LogEntry{
+			{Index: 3, Term: 2, Command: []byte("set x=1")},
+		},
+	}
+	resp, err := s.AppendEntries(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !resp.Success {
+		t.Error("expected AppendEntries accepted for matching previous entry, got rejected")
+	}
+
+	if len(s.log) != 3 {
+		t.Errorf("expected log length=3, got %d", len(s.log))
+	}
+
+	if s.log[2].Command == nil || string(s.log[2].Command) != "set x=1" {
+		t.Errorf("expected log[2].Command='set x=1', got %s", string(s.log[2].Command))
+	}
+
+	if req.PrevLogIndex != s.log[1].Index || req.PrevLogTerm != s.log[1].Term {
+		t.Errorf("expected PrevLogIndex=%d and PrevLogTerm=%d, got PrevLogIndex=%d and PrevLogTerm=%d",
+			s.log[1].Index, s.log[1].Term, req.PrevLogIndex, req.PrevLogTerm)
+	}
+}
+
+func TestAppendEntries_GapInPreviousEntries(t *testing.T) {
+	s := newServer(1, 0, 0, 0)
+	s.log = []*pb.LogEntry{
+		{Index: 1, Term: 1},
+		{Index: 2, Term: 2},
+	}
+	req := &pb.AppendEntriesRequest{
+		Term:         2,
+		PrevLogIndex: 3, // gap after index 2
+		PrevLogTerm:  2,
+		Entries: []*pb.LogEntry{
+			{Index: 4, Term: 2, Command: []byte("set x=1")},
+		},
+	}
+	resp, err := s.AppendEntries(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if resp.Success {
+		t.Error("expected AppendEntries rejected for gap in previous entries, got accepted")
+	}
+
+	if len(s.log) != 2 {
+		t.Errorf("expected log length=2 after rejection, got %d", len(s.log))
+	}
+
+	if resp.Term != 2 {
+		t.Errorf("expected resp.Term=2, got %d", resp.Term)
+	}
+
+	if s.timerResetCount == 0 {
+		t.Error("expected election timer to reset on gap rejection, but timerResetCount did not change")
+	}
+}
+
+func TestAppendEntries_ConflictInPreviousEntries(t *testing.T) {
+	s := newServer(1, 0, 0, 0)
+	s.log = []*pb.LogEntry{
+		{Index: 1, Term: 1},
+		{Index: 2, Term: 2},
+	}
+	req := &pb.AppendEntriesRequest{
+		Term:         2,
+		PrevLogIndex: 2,
+		PrevLogTerm:  1, // conflict with log[1].Term=2
+		Entries: []*pb.LogEntry{
+			{Index: 3, Term: 2, Command: []byte("set x=1")},
+		},
+	}
+	resp, err := s.AppendEntries(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if resp.Success {
+		t.Error("expected AppendEntries rejected for conflict in previous entries, got accepted")
+	}
+
+	if len(s.log) != 2 {
+		t.Errorf("expected log length=2, got %d", len(s.log))
+	}
+
+	if resp.Term != 2 {
+		t.Errorf("expected resp.Term=2, got %d", resp.Term)
+	}
+
+	if s.timerResetCount == 0 {
+		t.Error("expected election timer to reset on AppendEntries rejection due to log conflict, but timerResetCount did not change")
+	}
+
+}
+
+func TestAppendEntries_HeartbeatWithPrevLogIndexBeyondLog(t *testing.T) {
+	s := newServer(1, 0, 0, 0)
+	s.log = []*pb.LogEntry{
+		{Index: 1, Term: 1},
+		{Index: 2, Term: 2},
+	}
+	prevCount := s.timerResetCount
+
+	// Heartbeat (no entries) where leader believes follower is at index 5,
+	// but follower only has 2 entries. Consistency check must still run.
+	resp, err := s.AppendEntries(context.Background(), &pb.AppendEntriesRequest{
+		Term:         2,
+		PrevLogIndex: 5,
+		PrevLogTerm:  2,
+		Entries:      nil,
+	})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if resp.Success {
+		t.Error("expected AppendEntries rejected: heartbeat PrevLogIndex beyond follower log, got accepted")
+	}
+
+	if resp.Term != 2 {
+		t.Errorf("expected resp.Term=2, got %d", resp.Term)
+	}
+
+	if len(s.log) != 2 {
+		t.Errorf("expected log length=2, got %d", len(s.log))
+	}
+
+	if s.timerResetCount == prevCount {
+		t.Error("expected election timer to reset on valid-term heartbeat, but timerResetCount did not change")
 	}
 }

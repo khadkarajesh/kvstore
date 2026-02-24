@@ -7,8 +7,6 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	pb "github.com/rajesh/kvstore/proto"
 	raft "github.com/rajesh/kvstore/raft"
@@ -17,29 +15,28 @@ import (
 // RaftServer implements the gRPC RaftServiceServer interface.
 type RaftServer struct {
 	pb.UnimplementedRaftServiceServer
-	mu            sync.Mutex
-	state         raft.NodeState
-	currentTerm   int64
-	votedFor      uint32
-	lastLogIndex  uint64
-	lastLogTerm   uint64
-	electionTimer     *time.Timer
-	timerResetCount   int
+	mu              sync.Mutex
+	state           raft.NodeState
+	currentTerm     uint64
+	votedFor        uint32
+	lastHeartbeat   time.Time
+	timerResetCount int
+	log             []*pb.LogEntry
 }
 
 func (s *RaftServer) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if req.Term < uint64(s.currentTerm) {
+	if req.Term < s.currentTerm {
 		return &pb.RequestVoteResponse{
-			Term:        uint64(s.currentTerm),
+			Term:        s.currentTerm,
 			VoteGranted: false,
 		}, nil
 	}
 
-	if req.Term > uint64(s.currentTerm) {
-		s.currentTerm = int64(req.Term)
+	if req.Term > s.currentTerm {
+		s.currentTerm = req.Term
 		s.votedFor = 0
 		s.state = raft.Follower
 	}
@@ -47,19 +44,19 @@ func (s *RaftServer) RequestVote(ctx context.Context, req *pb.RequestVoteRequest
 	// Check if we can vote: haven't voted OR already voted for this candidate
 	alreadyVoted := s.votedFor != 0 && s.votedFor != req.CandidateId
 
-	logUpToDate := req.LastLogTerm > s.lastLogTerm ||
-		(req.LastLogTerm == s.lastLogTerm && req.LastLogIndex >= s.lastLogIndex)
+	logUpToDate := req.LastLogTerm > s.getLastLogTerm() ||
+		(req.LastLogTerm == s.getLastLogTerm() && req.LastLogIndex >= s.getLastLogIndex())
 
 	if !alreadyVoted && logUpToDate {
 		s.votedFor = req.CandidateId
 		return &pb.RequestVoteResponse{
-			Term:        uint64(s.currentTerm),
+			Term:        s.currentTerm,
 			VoteGranted: true,
 		}, nil
 	}
 
 	return &pb.RequestVoteResponse{
-		Term:        uint64(s.currentTerm),
+		Term:        s.currentTerm,
 		VoteGranted: false,
 	}, nil
 }
@@ -70,11 +67,17 @@ func randomElectionTimeout() time.Duration {
 
 func (s *RaftServer) runElectionTimer() {
 	for {
-		<-s.electionTimer.C // blocks until timer fires
+		timeout := randomElectionTimeout()
+		time.Sleep(timeout)
 
 		s.mu.Lock()
-		// timer fired → no heartbeat received in time
-		// → transition to Candidate, start election
+		// If a heartbeat arrived during our sleep, lastHeartbeat will be recent.
+		// Only start an election if no heartbeat has been received within the timeout
+		// window and we are still a follower.
+		if time.Since(s.lastHeartbeat) < timeout || s.state != raft.Follower {
+			s.mu.Unlock()
+			continue
+		}
 		s.state = raft.Candidate
 		s.currentTerm++
 		s.votedFor = 0
@@ -83,14 +86,22 @@ func (s *RaftServer) runElectionTimer() {
 }
 
 func resetElectionTimer(s *RaftServer) {
-	if !s.electionTimer.Stop() {
-		select {
-		case <-s.electionTimer.C:
-		default:
-		}
-	}
-	s.electionTimer.Reset(randomElectionTimeout())
+	s.lastHeartbeat = time.Now()
 	s.timerResetCount++
+}
+
+func (s *RaftServer) getLastLogIndex() uint64 {
+	if len(s.log) == 0 {
+		return 0
+	}
+	return s.log[len(s.log)-1].Index
+}
+
+func (s *RaftServer) getLastLogTerm() uint64 {
+	if len(s.log) == 0 {
+		return 0
+	}
+	return s.log[len(s.log)-1].Term
 }
 
 func (s *RaftServer) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
@@ -117,45 +128,75 @@ func (s *RaftServer) AppendEntries(ctx context.Context, req *pb.AppendEntriesReq
 	//   Apply committed entries to state machine
 	//   Tests: commitIndex advances, state machine applies
 
-	// Start with Step 1. Get heartbeat working with tests before touching
-	// log replication. Each step has a clear set of test cases you can
-	// derive from the rules above — same approach as RequestVote.
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// This is a heartbeat. Reset election timer if valid.
-	if req.Term < uint64(s.currentTerm) {
+	if req.Term < s.currentTerm {
 		return &pb.AppendEntriesResponse{
-			Term:    uint64(s.currentTerm),
+			Term:    s.currentTerm,
 			Success: false,
 		}, nil
 	}
 
-	if req.Term > uint64(s.currentTerm) {
-		s.currentTerm = int64(req.Term)
+	if req.Term > s.currentTerm {
+		s.currentTerm = req.Term
 		s.state = raft.Follower
-	} else if req.Term == uint64(s.currentTerm) && s.state == raft.Candidate {
+	} else if req.Term == s.currentTerm && s.state == raft.Candidate {
 		s.state = raft.Follower
+	}
+
+	if req.PrevLogIndex > 0 {
+		if req.PrevLogIndex > uint64(len(s.log)) {
+			resetElectionTimer(s)
+			return &pb.AppendEntriesResponse{
+				Term:    s.currentTerm,
+				Success: false,
+			}, nil
+		}
+		if s.log[req.PrevLogIndex-1].Term != req.PrevLogTerm {
+			resetElectionTimer(s)
+			return &pb.AppendEntriesResponse{
+				Term:    s.currentTerm,
+				Success: false,
+			}, nil
+		}
 	}
 
 	if len(req.Entries) == 0 {
 		// Valid heartbeat, reset timer
 		resetElectionTimer(s)
 		return &pb.AppendEntriesResponse{
-			Term:    uint64(s.currentTerm),
+			Term:    s.currentTerm,
 			Success: true,
 		}, nil
 	}
 
-	return nil, status.Errorf(codes.Unimplemented, "AppendEntries not implemented")
+	// Append new entries, truncating any conflicts
+	insertIndex := req.PrevLogIndex
+	for _, entry := range req.Entries {
+		if insertIndex < uint64(len(s.log)) {
+			if s.log[insertIndex].Term != entry.Term {
+				s.log = s.log[:insertIndex] // truncate conflicting entry and all that follow
+			} else {
+				insertIndex++
+				continue // entry already matches, skip to next
+			}
+		}
+		s.log = append(s.log, entry)
+		insertIndex++
+	}
+	resetElectionTimer(s)
+	return &pb.AppendEntriesResponse{
+		Term:    s.currentTerm,
+		Success: true,
+	}, nil
 }
 
 // NewRaftServer creates and returns a new RaftServer instance.
 func NewRaftServer() *RaftServer {
 	s := &RaftServer{
 		state:         raft.Follower,
-		electionTimer: time.NewTimer(randomElectionTimeout()),
+		lastHeartbeat: time.Now(),
 	}
 	go s.runElectionTimer()
 	return s
