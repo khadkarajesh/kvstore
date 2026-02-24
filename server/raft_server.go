@@ -22,6 +22,7 @@ type RaftServer struct {
 	lastHeartbeat   time.Time
 	timerResetCount int
 	log             []*pb.LogEntry
+	commitIndex     uint64
 }
 
 func (s *RaftServer) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
@@ -125,8 +126,8 @@ func (s *RaftServer) AppendEntries(ctx context.Context, req *pb.AppendEntriesReq
 
 	// Step 4 — Commit index
 	//   Update commitIndex = min(leaderCommit, lastLogIndex)
-	//   Apply committed entries to state machine
-	//   Tests: commitIndex advances, state machine applies
+	//   Tests: commitIndex advances on append and heartbeat, clamped, no regression
+	//   TODO: apply committed entries to KV state machine (Phase 2)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -163,7 +164,11 @@ func (s *RaftServer) AppendEntries(ctx context.Context, req *pb.AppendEntriesReq
 	}
 
 	if len(req.Entries) == 0 {
-		// Valid heartbeat, reset timer
+		// Valid heartbeat: advance commitIndex, reset timer.
+		// Leaders piggyback leaderCommit on heartbeats to drive follower state machines.
+		if req.LeaderCommit > s.commitIndex {
+			s.commitIndex = min(req.LeaderCommit, s.getLastLogIndex())
+		}
 		resetElectionTimer(s)
 		return &pb.AppendEntriesResponse{
 			Term:    s.currentTerm,
@@ -185,6 +190,11 @@ func (s *RaftServer) AppendEntries(ctx context.Context, req *pb.AppendEntriesReq
 		s.log = append(s.log, entry)
 		insertIndex++
 	}
+
+	if req.LeaderCommit > s.commitIndex {
+		s.commitIndex = min(req.LeaderCommit, s.getLastLogIndex())
+	}
+
 	resetElectionTimer(s)
 	return &pb.AppendEntriesResponse{
 		Term:    s.currentTerm,

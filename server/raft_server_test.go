@@ -455,3 +455,89 @@ func TestAppendEntries_HeartbeatWithPrevLogIndexBeyondLog(t *testing.T) {
 		t.Error("expected election timer to reset on valid-term heartbeat, but timerResetCount did not change")
 	}
 }
+
+func TestAppendEntries_CommitIndexAdvancesOnAppend(t *testing.T) {
+	s := newServer(1, 0, 0, 0)
+	s.log = []*pb.LogEntry{
+		{Index: 1, Term: 1},
+		{Index: 2, Term: 1},
+	}
+
+	_, err := s.AppendEntries(context.Background(), &pb.AppendEntriesRequest{
+		Term:         1,
+		PrevLogIndex: 2,
+		PrevLogTerm:  1,
+		Entries:      []*pb.LogEntry{{Index: 3, Term: 1, Command: []byte("set x=1")}},
+		LeaderCommit: 2,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// leaderCommit=2, lastLogIndex=3 → commitIndex = min(2,3) = 2
+	if s.commitIndex != 2 {
+		t.Errorf("expected commitIndex=2, got %d", s.commitIndex)
+	}
+}
+
+func TestAppendEntries_CommitIndexClampedToLastLogIndex(t *testing.T) {
+	s := newServer(1, 0, 0, 0)
+
+	_, err := s.AppendEntries(context.Background(), &pb.AppendEntriesRequest{
+		Term:         1,
+		Entries:      []*pb.LogEntry{{Index: 1, Term: 1, Command: []byte("set x=1")}},
+		LeaderCommit: 10, // leader is far ahead; follower only appended index 1
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// leaderCommit=10, lastLogIndex=1 → commitIndex = min(10,1) = 1
+	if s.commitIndex != 1 {
+		t.Errorf("expected commitIndex=1 (clamped to lastLogIndex), got %d", s.commitIndex)
+	}
+}
+
+func TestAppendEntries_CommitIndexAdvancesOnHeartbeat(t *testing.T) {
+	s := newServer(1, 0, 0, 0)
+	s.log = []*pb.LogEntry{
+		{Index: 1, Term: 1},
+		{Index: 2, Term: 1},
+		{Index: 3, Term: 1},
+	}
+	s.commitIndex = 1
+
+	_, err := s.AppendEntries(context.Background(), &pb.AppendEntriesRequest{
+		Term:         1,
+		LeaderCommit: 3, // heartbeat: no entries, but leader has committed up to 3
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if s.commitIndex != 3 {
+		t.Errorf("expected commitIndex=3, got %d", s.commitIndex)
+	}
+}
+
+func TestAppendEntries_CommitIndexDoesNotRegress(t *testing.T) {
+	s := newServer(1, 0, 0, 0)
+	s.log = []*pb.LogEntry{
+		{Index: 1, Term: 1},
+		{Index: 2, Term: 1},
+		{Index: 3, Term: 1},
+	}
+	s.commitIndex = 3
+
+	_, err := s.AppendEntries(context.Background(), &pb.AppendEntriesRequest{
+		Term:         1,
+		LeaderCommit: 2, // stale leaderCommit below current commitIndex
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if s.commitIndex != 3 {
+		t.Errorf("expected commitIndex to stay at 3, got %d", s.commitIndex)
+	}
+}
