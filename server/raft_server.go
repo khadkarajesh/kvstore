@@ -38,11 +38,6 @@ type RaftServer struct {
 	peers           map[uint32]*Peer
 }
 
-func (s *RaftServer) SetPeers(peers map[uint32]*Peer) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.peers = peers
-}
 
 func (s *RaftServer) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
 	s.mu.Lock()
@@ -344,9 +339,11 @@ func (s *RaftServer) AppendEntries(ctx context.Context, req *pb.AppendEntriesReq
 }
 
 // NewRaftServer creates and returns a new RaftServer instance.
-func NewRaftServer(id uint32) *RaftServer {
+// peers must be fully dialed before calling — the election timer starts immediately.
+func NewRaftServer(id uint32, peers map[uint32]*Peer) *RaftServer {
 	s := &RaftServer{
 		id:            id,
+		peers:         peers,
 		state:         raft.Follower,
 		lastHeartbeat: time.Now(),
 	}
