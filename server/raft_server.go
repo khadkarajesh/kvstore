@@ -12,9 +12,21 @@ import (
 	raft "github.com/rajesh/kvstore/raft"
 )
 
+type VoteReply struct {
+	Term        uint64
+	VoteGranted bool
+}
+
+type Peer struct {
+	ID     uint32
+	Client pb.RaftServiceClient
+	Conn   *grpc.ClientConn
+}
+
 // RaftServer implements the gRPC RaftServiceServer interface.
 type RaftServer struct {
 	pb.UnimplementedRaftServiceServer
+	id              uint32
 	mu              sync.Mutex
 	state           raft.NodeState
 	currentTerm     uint64
@@ -23,6 +35,13 @@ type RaftServer struct {
 	timerResetCount int
 	log             []*pb.LogEntry
 	commitIndex     uint64
+	peers           map[uint32]*Peer
+}
+
+func (s *RaftServer) SetPeers(peers map[uint32]*Peer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.peers = peers
 }
 
 func (s *RaftServer) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
@@ -66,8 +85,81 @@ func randomElectionTimeout() time.Duration {
 	return time.Duration(150+rand.Intn(150)) * time.Millisecond
 }
 
+func (s *RaftServer) sendRequestVote(peer *Peer) *VoteReply {
+	s.mu.Lock()
+	term := s.currentTerm
+	id := s.id
+	lastLogIndex := s.getLastLogIndex()
+	lastLogTerm := s.getLastLogTerm()
+	s.mu.Unlock()
+
+	resp, err := peer.Client.RequestVote(context.Background(), &pb.RequestVoteRequest{
+		Term:         term,
+		CandidateId:  id,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+	})
+	if err != nil || resp == nil {
+		return &VoteReply{}
+	}
+	return &VoteReply{
+		Term:        resp.Term,
+		VoteGranted: resp.VoteGranted,
+	}
+}
+
+func (s *RaftServer) becomeLeader() {
+	s.state = raft.Leader
+}
+
+func (s *RaftServer) sendHeartBeats(term uint64) {
+	for {
+		time.Sleep(50 * time.Millisecond)
+		s.mu.Lock()
+		if s.state != raft.Leader || s.currentTerm != term {
+			s.mu.Unlock()
+			return
+		}
+		s.mu.Unlock()
+		for _, peer := range s.peers {
+			p := peer
+			go func(pp *Peer) {
+				s.mu.Lock()
+				id := s.id
+				currentTerm := s.currentTerm
+				prevLogIndex := s.getLastLogIndex()
+				prevLogTerm := s.getLastLogTerm()
+				s.mu.Unlock()
+
+				resp, err := pp.Client.AppendEntries(context.Background(),
+					&pb.AppendEntriesRequest{
+						Term:         currentTerm,
+						LeaderId:     id,
+						PrevLogIndex: prevLogIndex,
+						PrevLogTerm:  prevLogTerm,
+						Entries:      nil,
+					},
+				)
+
+				if err != nil || resp == nil {
+					return
+				}
+
+				s.mu.Lock()
+				if resp.Term > s.currentTerm {
+					s.state = raft.Follower
+					s.currentTerm = resp.Term
+					s.votedFor = 0
+				}
+				s.mu.Unlock()
+			}(p)
+		}
+	}
+}
+
 func (s *RaftServer) runElectionTimer() {
 	for {
+
 		timeout := randomElectionTimeout()
 		time.Sleep(timeout)
 
@@ -79,9 +171,57 @@ func (s *RaftServer) runElectionTimer() {
 			s.mu.Unlock()
 			continue
 		}
+		voteCh := make(chan *VoteReply, len(s.peers))
 		s.state = raft.Candidate
 		s.currentTerm++
-		s.votedFor = 0
+		s.votedFor = s.id
+		votes := 1
+
+		for _, peer := range s.peers {
+			p := peer
+			go func(pp *Peer) {
+				voteCh <- s.sendRequestVote(pp)
+			}(p)
+		}
+		s.mu.Unlock()
+
+		deadline := time.After(timeout)
+		remaining := len(s.peers)
+
+		stepDown := false
+
+		for remaining > 0 {
+			select {
+			case voteReply := <-voteCh:
+				s.mu.Lock()
+				if voteReply.Term > s.currentTerm {
+					s.state = raft.Follower
+					votes = 0
+					stepDown = true
+					s.currentTerm = voteReply.Term
+					s.votedFor = 0
+				}
+				if voteReply.VoteGranted && voteReply.Term == s.currentTerm {
+					votes++
+				}
+				remaining--
+				s.mu.Unlock()
+			case <-deadline:
+				remaining = 0
+			}
+			if stepDown || votes > (len(s.peers)+1)/2 {
+				break
+			}
+		}
+		s.mu.Lock()
+		if s.state == raft.Candidate {
+			if votes > (len(s.peers)+1)/2 {
+				s.becomeLeader()
+				go s.sendHeartBeats(s.currentTerm)
+			} else {
+				s.state = raft.Follower
+			}
+		}
 		s.mu.Unlock()
 	}
 }
@@ -142,6 +282,7 @@ func (s *RaftServer) AppendEntries(ctx context.Context, req *pb.AppendEntriesReq
 	if req.Term > s.currentTerm {
 		s.currentTerm = req.Term
 		s.state = raft.Follower
+		s.votedFor = 0
 	} else if req.Term == s.currentTerm && s.state == raft.Candidate {
 		s.state = raft.Follower
 	}
@@ -203,8 +344,9 @@ func (s *RaftServer) AppendEntries(ctx context.Context, req *pb.AppendEntriesReq
 }
 
 // NewRaftServer creates and returns a new RaftServer instance.
-func NewRaftServer() *RaftServer {
+func NewRaftServer(id uint32) *RaftServer {
 	s := &RaftServer{
+		id:            id,
 		state:         raft.Follower,
 		lastHeartbeat: time.Now(),
 	}
