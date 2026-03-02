@@ -44,8 +44,8 @@ type RaftServer struct {
 	mu              sync.Mutex
 	state           raft.NodeState
 	currentTerm     uint64
-	votedFor        uint32
-	leaderID        uint32
+	votedFor        uint32 // 0 means "none"; valid peer IDs start at 1 (enforced in main.go)
+	leaderID        uint32 // 0 means unknown; cleared when this node steps down
 	lastHeartbeat   time.Time
 	timerResetCount int
 	log             []*pb.LogEntry
@@ -90,6 +90,7 @@ func (s *RaftServer) RequestVote(ctx context.Context, req *pb.RequestVoteRequest
 
 	if !alreadyVoted && logUpToDate {
 		s.votedFor = req.CandidateId
+		resetElectionTimer(s) // give the candidate time to win (Raft §5.2)
 		return &pb.RequestVoteResponse{
 			Term:        s.currentTerm,
 			VoteGranted: true,
@@ -114,7 +115,9 @@ func (s *RaftServer) sendRequestVote(peer *Peer) *VoteReply {
 	lastLogTerm := s.getLastLogTerm()
 	s.mu.Unlock()
 
-	resp, err := peer.Client.RequestVote(context.Background(), &pb.RequestVoteRequest{
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	resp, err := peer.Client.RequestVote(ctx, &pb.RequestVoteRequest{
 		Term:         term,
 		CandidateId:  id,
 		LastLogIndex: lastLogIndex,
@@ -238,7 +241,9 @@ func (s *RaftServer) replicateToPeer(peer *Peer, term uint64, ch chan struct{}) 
 		if startIdx < len(s.log) {
 			src := s.log[startIdx:]
 			entries = make([]*pb.LogEntry, len(src))
-			copy(entries, src)
+			for i, e := range src {
+				entries[i] = proto.Clone(e).(*pb.LogEntry)
+			}
 		}
 
 		currentTerm := s.currentTerm
@@ -246,7 +251,8 @@ func (s *RaftServer) replicateToPeer(peer *Peer, term uint64, ch chan struct{}) 
 		id := s.id
 		s.mu.Unlock()
 
-		resp, err := peer.Client.AppendEntries(context.Background(), &pb.AppendEntriesRequest{
+		rpcCtx, rpcCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		resp, err := peer.Client.AppendEntries(rpcCtx, &pb.AppendEntriesRequest{
 			Term:         currentTerm,
 			LeaderId:     id,
 			PrevLogIndex: prevLogIndex,
@@ -255,6 +261,7 @@ func (s *RaftServer) replicateToPeer(peer *Peer, term uint64, ch chan struct{}) 
 			LeaderCommit: leaderCommit,
 		})
 
+		rpcCancel()
 		if err != nil || resp == nil {
 			continue
 		}
@@ -328,8 +335,10 @@ func (s *RaftServer) triggerReplication() {
 }
 
 // clearPending signals all waiting Put/Get handlers that the leader stepped
-// down. Must be called with s.mu held.
+// down and clears leaderID so forwarding falls back to "no known leader".
+// Must be called with s.mu held.
 func (s *RaftServer) clearPending(err error) {
+	s.leaderID = 0
 	for idx, ch := range s.pending {
 		ch <- applyResult{err: err}
 		delete(s.pending, idx)
