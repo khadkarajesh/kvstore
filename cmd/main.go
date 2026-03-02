@@ -41,9 +41,11 @@ func dialPeers(peersStr string) map[uint32]*server.Peer {
 		}
 		id := uint32(peerID)
 		peers[id] = &server.Peer{
-			ID:     id,
-			Client: pb.NewRaftServiceClient(conn),
-			Conn:   conn,
+			ID:       id,
+			Addr:     parts[1],
+			Client:   pb.NewRaftServiceClient(conn),
+			KVClient: pb.NewKVServiceClient(conn),
+			Conn:     conn,
 		}
 	}
 	return peers

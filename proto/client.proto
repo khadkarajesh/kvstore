@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package kv;
+
+option go_package = "github.com/rajesh/kvstore/proto";
+
+// KVCommand is encoded into LogEntry.command bytes for log replication.
+message KVCommand {
+  string op    = 1; // "put" or "delete"
+  string key   = 2;
+  string value = 3; // empty for delete
+}
+
+message PutRequest  { string key = 1; string value = 2; }
+message PutResponse { bool success = 1; string leader_addr = 2; }
+
+message GetRequest  { string key = 1; }
+message GetResponse { string value = 1; bool found = 2; string leader_addr = 3; }
+
+service KVService {
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+}

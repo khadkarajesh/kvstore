@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	pb "github.com/rajesh/kvstore/proto"
@@ -13,7 +14,10 @@ func newServer(term uint64, votedFor uint32, lastLogIndex, lastLogTerm uint64) *
 		state:       raft.Follower,
 		currentTerm: term,
 		votedFor:    votedFor,
+		kv:          make(map[string]string),
+		pending:     make(map[uint64]chan applyResult),
 	}
+	s.applyCond = sync.NewCond(&s.mu)
 	if lastLogIndex > 0 {
 		s.log = append(s.log, &pb.LogEntry{Index: lastLogIndex, Term: lastLogTerm})
 	}
