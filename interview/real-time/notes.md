@@ -124,6 +124,48 @@ Mechanism:
 
   After upgrade: raw TCP frames, no HTTP headers per message.
 
+---
+Why HTTP upgrade handshake?
+
+  WebSocket is not a standalone protocol — it starts as a normal HTTP
+  request, then asks the server to switch protocols on the same TCP
+  connection. The 101 response means "agreed, switching now."
+
+  After 101: same TCP connection, both sides stop speaking HTTP and
+  start speaking WebSocket frames. No new connection opened.
+
+  Why designed this way:
+    WebSocket reuses port 80/443 (HTTP ports). To a firewall, the
+    initial request looks like normal HTTP — it passes through.
+    By the time the connection upgrades, the TCP tunnel is already open.
+    A dedicated WebSocket port would be blocked by most corporate firewalls.
+
+---
+Why old proxies break WebSockets (3 failure modes):
+
+  Problem A — Proxy strips Upgrade headers:
+    Upgrade and Connection are hop-by-hop headers. Old proxies were
+    designed to strip headers they don't understand before forwarding.
+    Server receives a plain GET with no upgrade headers → responds 200,
+    not 101 → handshake never completes.
+
+  Problem B — Proxy buffers WebSocket frames as HTTP:
+    After forwarding 101, old proxy waits for the next HTTP request.
+    Client sends raw WebSocket binary frames instead. Proxy sees
+    non-HTTP data → drops it or closes the connection silently.
+
+  Problem C — Proxy applies HTTP response timeout:
+    Old proxy expects a response to complete within N seconds.
+    WebSocket connection never "completes" — it stays open.
+    Proxy kills it after timeout → client reconnects → killed again
+    → infinite reconnect loop.
+
+  Fix: use wss:// (WebSocket over TLS, port 443).
+    Proxy sees encrypted bytes it cannot inspect → passes through blindly
+    → never strips headers, never buffers frames, never applies HTTP timeouts.
+    This is why production WebSocket always runs on wss://, not ws://.
+
+---
   Pros:
     → truly bidirectional — client and server both push freely
     → low latency (<10ms message delivery on LAN)
