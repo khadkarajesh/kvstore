@@ -189,6 +189,60 @@ Why old proxies break WebSockets (3 failure modes):
     → chat, collaborative editing, multiplayer games, live trading
     → any scenario requiring client → server push at high frequency
 
+---
+Presence — tracking whether a user is currently active
+
+  Presence answers: is this user active, idle, or offline?
+  It covers all forms of "no longer reachable":
+    → user closed the browser tab
+    → phone backgrounded the app
+    → network dropped
+    → user idle (tab open but no activity)
+    → explicit logout
+
+  Not just connection open/closed. A WebSocket can be open while the
+  user has been away for 3 hours. Presence tracks actual activity, not
+  just TCP connection state.
+
+  Implementation — heartbeat + TTL in Redis:
+    User connects    → SET presence:{user_id} "online" EX 30
+    Every 20 seconds → SETEX presence:{user_id} 30 "online"  (reset TTL)
+    Heartbeats stop  → TTL expires after 30s → key gone → user = offline
+
+  One mechanism handles all offline scenarios. You don't detect the
+  specific cause — absence of heartbeat means not present.
+
+---
+Sequence numbers — why WebSocket tracks them
+
+  Three problems sequence numbers solve:
+
+  Problem 1 — Ordering concurrent events:
+    Two users send messages at the "same time." Client clocks are not
+    perfectly in sync (clock skew). If you order by client timestamp,
+    the message that arrived second may have an earlier timestamp.
+    Sequence number is assigned by the SERVER at receive time —
+    server clock is the single source of truth.
+
+    User A sends at client time 10:00:00.050  → server assigns seq=1
+    User B sends at client time 10:00:00.020  → server assigns seq=2
+    Correct order: A then B, regardless of client timestamps.
+
+  Problem 2 — Detecting missed messages:
+    WebSocket messages can be dropped silently. Without sequence numbers
+    the client has no way to know a message was missed.
+
+    Client receives: seq=1, seq=2, seq=4
+                                   ↑ seq=3 missing → client requests replay
+
+  Problem 3 — Deduplication on reconnect:
+    On reconnect, server replays recent messages to cover the gap.
+    Client tells server its last received sequence number.
+    Server replays only what the client missed. No duplicates.
+
+    Client: "last received seq=5"
+    Server: replays seq=6, seq=7, seq=8 only
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 6. Scaling WebSockets
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
