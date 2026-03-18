@@ -105,6 +105,51 @@ Kafka multiple consumer groups — broadcast to groups:
 
 ---
 
+### Exactly-once per consumer group — real-world significance
+
+The question: "if I scale to 3 consumers, does each message get processed once or three times?"
+
+Redis pub/sub — every subscriber gets every message:
+  PUBLISH "orders" {order_id: 42}
+  → Consumer 1 receives it → sends confirmation email
+  → Consumer 2 receives it → sends confirmation email
+  → Consumer 3 receives it → sends confirmation email
+  Result: user receives 3 emails. Wrong.
+
+Kafka consumer group — exactly one consumer per message:
+  PRODUCE to "orders" topic
+  → Consumer 1 receives it (owns the partition) → sends email
+  → Consumer 2 receives nothing
+  → Consumer 3 receives nothing
+  Result: user receives 1 email. Correct.
+
+Real-world impact:
+
+  | Operation              | Redis pub/sub         | Kafka consumer group   |
+  |------------------------|-----------------------|------------------------|
+  | Send confirmation email| 3 emails sent (wrong) | 1 email sent (correct) |
+  | Charge credit card     | Charged 3x (disaster) | Charged once (correct) |
+  | Decrement inventory    | -3 stock (wrong)      | -1 stock (correct)     |
+  | Route to SSE server    | All 3 check, 1 acts   | Fine — side effect is  |
+  |                        | (correct, harmless)   | naturally exclusive    |
+
+Rule:
+  Side effect must happen exactly once (charge, email, DB write)?
+    → Kafka consumer group
+
+  Operation is read-only or harmless when duplicated (SSE routing,
+  cache lookup — only the server holding the connection acts on it)?
+    → Redis pub/sub is fine
+
+Why Redis is still correct for SSE routing despite broadcast:
+  All 3 servers receive the message. Servers 2 and 3 look up their
+  local connection map — user 42 is not there — they discard silently.
+  Only Server 1 has the connection and writes to it. Duplicate delivery
+  is harmless because the side effect only fires on the one server
+  that holds the connection.
+
+---
+
 ### One-liner for interviews
 
 Redis pub/sub:
