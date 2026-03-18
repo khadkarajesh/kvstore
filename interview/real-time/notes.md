@@ -99,6 +99,9 @@ Mechanism:
     → one-directional only — client cannot send data over the SSE connection
     → browser limit: 6 HTTP/1.1 connections per domain (mitigated by HTTP/2)
     → text-only (UTF-8) — binary data must be base64-encoded
+    → stateful — server holds an open HTTP response object per connected user
+      in memory. Same as WebSocket connection state. Event routing must reach
+      the specific server holding that response object (solved via Redis pub/sub).
 
   When to use:
     → notifications, live feeds, dashboards
@@ -173,9 +176,12 @@ Why old proxies break WebSockets (3 failure modes):
     → binary or text frames
 
   Cons:
-    → stateful — server must track which socket belongs to which user
+    → stateful — server holds an open socket object per connected user, same
+      as SSE. Additionally, WebSocket servers often track per-user application
+      state (which room, presence status, message sequence numbers) that SSE
+      does not require — compounding the statefulness problem.
     → hard to scale horizontally (see §6)
-    → some corporate firewalls and proxies block WebSocket upgrades
+    → some corporate firewalls and proxies block WebSocket upgrades (use wss://)
     → connection management overhead (heartbeats, reconnect logic)
     → load balancers need sticky sessions or L4 passthrough
 
