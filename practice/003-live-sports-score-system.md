@@ -175,6 +175,59 @@ add a fan-out tier between them. Repeat until no single node is overwhelmed.
 
 ---
 
+## Redis Channel Sharding vs Hierarchical Fan-out — When to Use Which
+
+These fix different bottlenecks on different resources. They are not
+the same thing even though both involve "too much load on Redis."
+
+  CPU bottleneck (channel sharding fixes this):
+    Caused by: high event frequency × many subscribers per channel
+    Redis work: on every PUBLISH, Redis loops through all subscribers,
+                serializes the message, copies into each send buffer.
+                This runs in Redis's single-threaded event loop.
+                100,000 events/sec × 200 subscribers = event loop saturated.
+    Resource:   Redis CPU / event loop time
+    Fix:        split "match:10" into "match:10:shard:0..N"
+                publisher writes to all shards, each shard covers a
+                subset of servers, CPU work spread across shards
+
+  Connection bottleneck (hierarchical fan-out fixes this):
+    Caused by: too many persistent TCP connections into Redis
+    Redis work: each connected server costs a file descriptor + buffers
+                200 SSE servers = 200 file descriptors (fine)
+                100,000 servers = 100,000 file descriptors → OS limit hit
+                Redis starts rejecting new connections before CPU is a problem
+    Resource:   file descriptors + memory, not CPU
+    Fix:        Redis talks to 10 regional fan-out servers only
+                each fan-out server maintains connections to 20 edge servers
+                Redis connection count drops from 200 → 10
+
+Concrete scenarios:
+
+  Low frequency, many subscribers:
+    1 event/minute, 10,000 subscribers
+    → connection bottleneck (10,000 file descriptors)
+    → NOT CPU bottleneck (one PUBLISH per minute)
+    Fix: hierarchical fan-out only
+
+  High frequency, few subscribers:
+    100,000 events/sec, 10 subscribers (e.g. stock ticker)
+    → CPU bottleneck (event loop saturated)
+    → NOT connection bottleneck (only 10 file descriptors)
+    Fix: channel sharding only
+
+  High frequency, many subscribers:
+    100,000 events/sec, 10,000 subscribers
+    → both bottlenecks hit
+    Fix: channel sharding + hierarchical fan-out
+
+Sports score system falls into "low frequency, many subscribers":
+  A goal every few minutes → CPU is not the problem.
+  200 SSE servers holding persistent connections → connections matter.
+  Hierarchical fan-out is the right fix. Channel sharding is not needed.
+
+---
+
 ## Hotspot Analysis
 
 Where hotspots live depends on write vs read volume:
@@ -317,6 +370,149 @@ Strong answer:
 
 ---
 
+## Initial State on Connect
+
+SSE only delivers future events. When a user opens the page, the SSE
+stream has not started yet — they need the current score immediately.
+
+Correct pattern:
+  Step 1 → REST API:  GET /match/10/score → returns current score state
+  Step 2 → SSE:       connection opens, receives all future updates
+
+Without step 1, user sees a blank score until the next goal is scored.
+This is the standard pattern for any real-time system — REST for current
+state, SSE/WebSocket for delta updates.
+
+Race condition to handle:
+  A goal could be scored between step 1 and step 2.
+  Fix: SSE stream includes sequence numbers. If REST response returns
+  seq=5 and first SSE event received is seq=7, client knows seq=6 was
+  missed and requests a replay.
+
+---
+
+## Channel Sharding — Publisher Behavior
+
+When "match:10" is sharded into N channels, the publisher (score consumer)
+must write to ALL shards — not one. Every shard carries the same event
+because every SSE server needs the event.
+
+```
+Goal scored → score consumer:
+  PUBLISH "match:10:shard:0"  '{"score":"2-1","seq":6}'
+  PUBLISH "match:10:shard:1"  '{"score":"2-1","seq":6}'
+  PUBLISH "match:10:shard:2"  '{"score":"2-1","seq":6}'
+  PUBLISH "match:10:shard:3"  '{"score":"2-1","seq":6}'
+```
+
+Each SSE server subscribes to exactly one shard based on its index:
+  shard_id = floor(server_index / servers_per_shard)
+  Server 37  (index 37,  50 per shard) → shard 0
+  Server 72  (index 72,  50 per shard) → shard 1
+  Server 130 (index 130, 50 per shard) → shard 2
+
+Sharding splits the delivery workload across N channels.
+It does NOT split the data — every server still gets every event.
+
+---
+
+## Score Consumer Fault Tolerance
+
+The score consumer is a single process reading from Kafka and publishing
+to Redis. If it crashes, score events stop flowing.
+
+Fix: run multiple consumer instances in the same Kafka consumer group.
+
+```
+Kafka partition for "match:10"
+        ↓
+Consumer Group "score-fan-out"
+  → Consumer A (active, owns the partition)
+  → Consumer B (standby)
+  → Consumer C (standby)
+```
+
+Kafka assigns the partition to one consumer at a time. If Consumer A
+crashes, Kafka detects the missed heartbeat (~10s) and reassigns the
+partition to Consumer B. Events resume automatically.
+
+Offset commit behavior:
+  Consumer reads event from Kafka → publishes to Redis → commits offset.
+  If consumer crashes after Redis publish but before offset commit:
+    → on restart, replays the same event from Kafka
+    → Redis receives duplicate PUBLISH
+    → SSE servers receive duplicate event
+    → clients deduplicate by sequence number (already have seq=6, discard)
+  This is safe because sequence numbers make the delivery idempotent.
+
+---
+
+## L7 Load Balancer Configuration for SSE
+
+SSE connections are long-lived. Standard LB defaults break them.
+Two critical settings required:
+
+  proxy_buffering off:
+    By default nginx buffers the response until complete before forwarding.
+    SSE never completes — client receives nothing until connection closes.
+    Must disable buffering so each data: line is forwarded immediately.
+
+  Long read timeout:
+    Default LB timeout is ~60s. SSE connections live for hours.
+    LB kills the connection after 60s → client reconnects → killed again
+    → infinite reconnect loop.
+    Set timeout to match expected connection lifetime (hours or infinite)
+    for SSE endpoints only. Keep short timeout for regular API endpoints.
+
+  nginx config:
+    location /match/events {
+        proxy_pass         http://sse_backend;
+        proxy_buffering    off;
+        proxy_read_timeout 24h;
+        proxy_cache        off;
+    }
+
+L7 is required (not L4) because these settings are per-endpoint —
+L4 operates at TCP level and cannot inspect URLs or content types.
+
+---
+
+## Multiple Concurrent Matches
+
+World Cup scenario: 8 matches simultaneously, each with millions of viewers.
+
+Each match is an independent Redis channel:
+  "match:10", "match:11", "match:12" ... "match:17"
+
+Each SSE server subscribes only to the channel for the match
+the user connected to watch — not all active match channels.
+
+```
+User watching match 10 connects to Server 42:
+  Server 42 subscribes to "match:10" (if not already subscribed)
+
+User watching match 11 connects to Server 42:
+  Server 42 subscribes to "match:11"
+
+Server 42 internal state:
+  {
+    "match:10" → [response_A, response_B, response_C, ...]
+    "match:11" → [response_D, response_E, ...]
+  }
+```
+
+Server subscribes to a channel on first user connection for that match
+and unsubscribes when the last user watching that match disconnects.
+
+Scale implication:
+  8 simultaneous popular matches × 10M viewers each = 80M connections
+  Each SSE server now holds connections for multiple matches
+  and subscribes to multiple Redis channels simultaneously.
+  Hierarchical fan-out becomes more important — regional servers
+  handle only the matches popular in their region.
+
+---
+
 ## Knowledge Gaps to Watch (filled during study session)
 
 Gap 1 — Kafka vs Redis as alternatives:
@@ -328,3 +524,21 @@ Gap 2 — Shallow bottleneck analysis:
   "Add more servers" is not enough. Trace one event end-to-end.
   Name the specific component that breaks and why.
   Then propose the fix at that specific component.
+
+Gap 3 — Initial state on connect:
+  SSE only delivers future events. Always pair with a REST call
+  to fetch current state before opening the SSE stream.
+  Handle the race condition with sequence numbers.
+
+Gap 4 — Channel sharding publisher behavior:
+  Publisher writes to ALL shards, not one.
+  Sharding splits delivery workload, not the data itself.
+
+Gap 5 — Consumer fault tolerance:
+  Multiple consumers in same consumer group.
+  Kafka reassigns partition on crash (~10s).
+  Sequence numbers make duplicate delivery safe.
+
+Gap 6 — L7 LB configuration:
+  proxy_buffering off — without this client receives nothing.
+  Long read timeout — without this connections die every 60s.
