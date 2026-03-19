@@ -175,6 +175,45 @@ add a fan-out tier between them. Repeat until no single node is overwhelmed.
 
 ---
 
+## Hotspot Analysis
+
+Where hotspots live depends on write vs read volume:
+
+  Few writers, many readers → hotspot on the fan-out (read) side
+    Sports score:     1 score service writes → 10M viewers receive
+                      Hotspot: Redis channel delivering to 200 servers
+    Celebrity tweet:  1 celebrity writes     → 50M followers receive
+                      Hotspot: fan-out service, not Kafka write volume
+
+  Many writers, few readers → hotspot on the write side
+    IoT sensors:      millions of devices writing to Kafka
+                      partitioned by device_type → all thermostats
+                      land on one partition → hot partition
+                      Fix: device_type + device_id as partition key
+                           spreads writes by identity across partitions
+
+---
+Hotspot fix rule:
+  Write hotspot → add identity cardinality to the partition key
+                  (device_type → device_type + device_id)
+                  NOT time-based suffixes — time does not distribute
+                  identity load, it only creates time-based buckets
+
+  Read/fan-out hotspot → shard the Redis channel
+                  "match:10" → "match:10:shard:0", "match:10:shard:1"...
+                  each shard covers a subset of SSE servers
+                  score consumer publishes to all shards
+                  no single Redis channel overwhelmed
+
+---
+Sports score specific — why Kafka partition hotspot is NOT the problem:
+  The score service has 1-2 writers publishing score events.
+  Write throughput is negligible — a match produces maybe 30 events/hr.
+  Partitioning by match_id is correct and sufficient.
+  The hotspot is entirely on the Redis fan-out side, not Kafka writes.
+
+---
+
 ## Ordering
 
 Redis pub/sub delivers messages in the order they are published.
