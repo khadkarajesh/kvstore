@@ -443,22 +443,51 @@ Why separate service:
 
 ### 16. Distributed Message ID — Snowflake over UUID
 
-Document mentions UUID v7 or Snowflake. The choice matters for Cassandra.
+The choice of ID scheme directly affects Cassandra write performance.
 
-UUID (random):
-  Not time-ordered. Used as Cassandra clustering key → random write
-  scatter across the partition → poor write performance, read amplification.
+How Cassandra stores data — LSM Tree:
+  Cassandra uses a Log-Structured Merge Tree. Writes always append to
+  the end of a file — never in the middle. This is why Cassandra is
+  fast for writes — no random seeks, just append.
 
-Snowflake ID (Twitter's approach):
+  LSM tree loves appending to the end.
+  Time-ordered IDs = always append to end = fast.
+  Random IDs     = insert anywhere in the middle = slow.
+
+UUID (random) — wrong choice for clustering key:
+  UUID values have no relationship to each other (f47ac10b, 3c4d9e2a...).
+  Cassandra must sort each new UUID into its correct position within
+  the partition — cannot just append.
+  Result:
+    - Write amplification: data rewritten during compaction to maintain order
+    - Read amplification: range queries scan more files (data scattered non-chronologically)
+    - At 1.15M writes/sec: compaction runs constantly, read latency spikes
+
+UUID (random) partition writes:
+  Insert f47ac10b → position 8 in sorted order
+  Insert 3c4d9e2a → position 2 (before f47ac10b, must reorder)
+  Insert a1b2c3d4 → position 6 (middle, must reorder)
+
+Snowflake ID (Twitter's approach) — correct choice:
   64-bit integer = 41-bit timestamp + 10-bit machine ID + 12-bit sequence
-  Time-ordered → sequential writes into Cassandra partition → fast appends
-  Supports 4,096 IDs per millisecond per machine
-  Globally unique without coordination between machines
+  Always increasing over time → new messages always larger than old ones
+  → Cassandra always appends to end of partition → no sorting needed
+  → compaction is minimal → consistent read latency
 
-Why it matters:
-  Cassandra LSM tree loves sequential writes. Random writes cause
-  compaction overhead and slow range scans. Always use time-ordered IDs
-  as clustering keys in Cassandra.
+Snowflake partition writes:
+  Insert 1704067200001 → append at end
+  Insert 1704067200002 → append at end (always larger)
+  Insert 1704067200003 → append at end (always larger)
+
+Properties:
+  - Time-ordered: sequential writes, efficient range scans
+  - Globally unique: no coordination needed between machines
+  - 4,096 IDs per millisecond per machine — sufficient for any scale
+  - Sortable by creation time without a separate timestamp column
+
+Rule: when choosing a Cassandra clustering key, always ask:
+  "Will new values always be larger than old ones?"
+  Yes → sequential writes, fast. No → scattered writes, slow.
 
 ---
 
